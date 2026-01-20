@@ -1,0 +1,20 @@
+name = "gemmology-api"
+main = "src/index.ts"
+compatibility_date = "2024-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "production"
+
+# Development settings
+[dev]
+port = 8787
+
+# Route configuration for api.gemmology.dev
+[[routes]]
+pattern = "api.gemmology.dev/*"
+zone_name = "gemmology.dev"
+
+# Static assets (if needed for Python wheels)
+[site]
+bucket = "./public"
