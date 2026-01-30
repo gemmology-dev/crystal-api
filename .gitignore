@@ -5,6 +5,9 @@ node_modules/
 .wrangler/
 .dev.vars
 
+# Secrets
+.secrets
+
 # Build output
 dist/
 

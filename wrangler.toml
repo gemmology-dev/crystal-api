@@ -18,3 +18,25 @@ zone_name = "gemmology.dev"
 # Static assets (if needed for Python wheels)
 [site]
 bucket = "./public"
+
+# KV Namespaces for invite code system
+# Create these with:
+#   npx wrangler kv:namespace create "INVITE_CODES"
+#   npx wrangler kv:namespace create "INVITE_CODES" --preview
+#   npx wrangler kv:namespace create "CODE_REQUESTS"
+#   npx wrangler kv:namespace create "CODE_REQUESTS" --preview
+# Then replace the IDs below with the output
+
+[[kv_namespaces]]
+binding = "INVITE_CODES"
+id = "629082018b90407fa86d6479acfd82d1"
+preview_id = "c75a219b23494d7ebd9b3b1165ee67ff"
+
+[[kv_namespaces]]
+binding = "CODE_REQUESTS"
+id = "5e7f45e5b36d48e7b8f2f47ff1c7abb0"
+preview_id = "11dfb4f0be464e08b4024a6edb8a5d62"
+
+# Secrets (set via: npx wrangler secret put SECRET_NAME)
+# - JWT_SECRET: Secret key for signing session tokens
+# - ADMIN_PASSWORD: Password for admin panel access
