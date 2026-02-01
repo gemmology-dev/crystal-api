@@ -150,8 +150,10 @@ export function parseCDL(cdl: string): ValidationResult {
     return { valid: false, error: 'CDL expression too long (max 500 characters)' };
   }
 
-  // Split by modifier if present
-  const [mainPart, modifier] = trimmed.split('|').map(s => s.trim());
+  // Split by modifier if present - first part is forms, rest are modifiers
+  const parts = trimmed.split('|').map(s => s.trim());
+  const mainPart = parts[0];
+  const modifier = parts.length > 1 ? parts.slice(1).join(' | ') : undefined;
 
   // Parse system and point group: system[point_group]:forms
   const systemMatch = mainPart.match(/^(\w+)\[([^\]]+)\]:(.+)$/);
