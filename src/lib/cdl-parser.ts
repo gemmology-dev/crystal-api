@@ -15,11 +15,23 @@ export interface CrystalForm {
   scale: number;
 }
 
+export interface TwinSpec {
+  law: string;
+}
+
+export interface ModificationSpec {
+  type: 'elongate' | 'flatten' | 'scale';
+  axis: 'a' | 'b' | 'c';
+  factor: number;
+}
+
 export interface CDLParseResult {
   system: string;
   pointGroup: string;
   forms: CrystalForm[];
   modifier?: string;
+  twin?: TwinSpec;
+  modifications?: ModificationSpec[];
 }
 
 export interface ValidationResult {
@@ -180,6 +192,29 @@ export function parseCDL(cdl: string): ValidationResult {
     return { valid: false, error: 'At least one crystal form is required' };
   }
 
+  // Parse twin and modifications from modifier string
+  let twin: TwinSpec | undefined;
+  const modifications: ModificationSpec[] = [];
+
+  if (modifier) {
+    // Parse twin: twin(name)
+    const twinMatch = modifier.match(/twin\s*\(\s*(\w+)\s*\)/i);
+    if (twinMatch) {
+      twin = { law: twinMatch[1].toLowerCase() };
+    }
+
+    // Parse modifications: elongate(c:2.0), flatten(a:0.5), scale(b:1.5)
+    const modRegex = /(elongate|flatten|scale)\s*\(\s*([abc])\s*:\s*([\d.]+)\s*\)/gi;
+    let modMatch;
+    while ((modMatch = modRegex.exec(modifier)) !== null) {
+      modifications.push({
+        type: modMatch[1].toLowerCase() as ModificationSpec['type'],
+        axis: modMatch[2].toLowerCase() as ModificationSpec['axis'],
+        factor: parseFloat(modMatch[3]),
+      });
+    }
+  }
+
   return {
     valid: true,
     parsed: {
@@ -187,6 +222,8 @@ export function parseCDL(cdl: string): ValidationResult {
       pointGroup,
       forms,
       modifier,
+      twin,
+      modifications: modifications.length > 0 ? modifications : undefined,
     },
   };
 }

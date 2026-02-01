@@ -3,7 +3,8 @@
  * Generates 3D crystal geometry using half-space intersection algorithm
  */
 
-import type { CDLParseResult, MillerIndex } from './cdl-parser';
+import type { CDLParseResult, MillerIndex, ModificationSpec } from './cdl-parser';
+import { generateTwinnedGeometry } from './twin-generator';
 
 export interface Vector3 {
   x: number;
@@ -401,5 +402,72 @@ export function generateGeometry(parsed: CDLParseResult): CrystalGeometry {
     }
   }
 
-  return { vertices, faces, edges };
+  let geometry: CrystalGeometry = { vertices, faces, edges };
+
+  // Apply modifications (elongate, flatten, scale)
+  if (parsed.modifications && parsed.modifications.length > 0) {
+    geometry = applyModifications(geometry, parsed.modifications);
+  }
+
+  // Apply twin transformation
+  if (parsed.twin) {
+    geometry = generateTwinnedGeometry(geometry, parsed.twin.law);
+  }
+
+  return geometry;
+}
+
+/**
+ * Apply modifications to geometry (elongate, flatten, scale)
+ */
+function applyModifications(geom: CrystalGeometry, mods: ModificationSpec[]): CrystalGeometry {
+  // Calculate scale factors for each axis
+  const scales = { a: 1, b: 1, c: 1 };
+
+  for (const mod of mods) {
+    let factor = mod.factor;
+    if (mod.type === 'flatten') {
+      factor = 1 / factor;
+    }
+    scales[mod.axis] *= factor;
+  }
+
+  // Apply scales to vertices
+  const newVertices = geom.vertices.map(v => ({
+    x: v.x * scales.a,
+    y: v.y * scales.b,
+    z: v.z * scales.c,
+  }));
+
+  // Apply scales to face vertices and recalculate normals
+  const newFaces = geom.faces.map(face => {
+    const scaledVertices = face.vertices.map(v => ({
+      x: v.x * scales.a,
+      y: v.y * scales.b,
+      z: v.z * scales.c,
+    }));
+
+    // Recalculate normal after scaling
+    let normal = face.normal;
+    if (scaledVertices.length >= 3) {
+      const v0 = scaledVertices[0];
+      const v1 = scaledVertices[1];
+      const v2 = scaledVertices[2];
+      const edge1 = sub(v1, v0);
+      const edge2 = sub(v2, v0);
+      normal = normalize(cross(edge1, edge2));
+    }
+
+    return {
+      ...face,
+      vertices: scaledVertices,
+      normal,
+    };
+  });
+
+  return {
+    vertices: newVertices,
+    faces: newFaces,
+    edges: geom.edges,
+  };
 }
