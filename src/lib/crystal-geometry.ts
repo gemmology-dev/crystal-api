@@ -1,9 +1,13 @@
 /**
  * Crystal Geometry Engine - JavaScript implementation
- * Generates 3D crystal geometry using half-space intersection algorithm
+ * Ported from Python crystal_geometry.geometry
+ *
+ * Generates 3D crystal geometry using half-space intersection algorithm.
  */
 
 import type { CDLParseResult, MillerIndex, ModificationSpec } from './cdl-parser';
+import type { HalfspaceData } from './halfspace';
+import { computeHalfspaceIntersection } from './halfspace';
 import { generateTwinnedGeometry } from './twin-generator';
 
 export interface Vector3 {
@@ -25,22 +29,16 @@ export interface CrystalGeometry {
 }
 
 // Crystal system parameters (unit cell ratios and angles)
+// NOTE: c_ratio = 1.0 for hex/trigonal matches Python default behavior
 const SYSTEM_PARAMS: Record<string, { a: number; b: number; c: number; alpha: number; beta: number; gamma: number }> = {
   cubic: { a: 1, b: 1, c: 1, alpha: 90, beta: 90, gamma: 90 },
   tetragonal: { a: 1, b: 1, c: 1.2, alpha: 90, beta: 90, gamma: 90 },
   orthorhombic: { a: 1, b: 1.2, c: 0.8, alpha: 90, beta: 90, gamma: 90 },
-  hexagonal: { a: 1, b: 1, c: 1.5, alpha: 90, beta: 90, gamma: 120 },
-  trigonal: { a: 1, b: 1, c: 1.5, alpha: 90, beta: 90, gamma: 120 },
+  hexagonal: { a: 1, b: 1, c: 1, alpha: 90, beta: 90, gamma: 120 },
+  trigonal: { a: 1, b: 1, c: 1, alpha: 90, beta: 90, gamma: 120 },
   monoclinic: { a: 1, b: 1.2, c: 0.9, alpha: 90, beta: 110, gamma: 90 },
   triclinic: { a: 1, b: 1.1, c: 0.95, alpha: 80, beta: 85, gamma: 75 },
 };
-
-/**
- * Convert degrees to radians
- */
-function toRadians(degrees: number): number {
-  return (degrees * Math.PI) / 180;
-}
 
 /**
  * Vector operations
@@ -84,11 +82,43 @@ function normalize(v: Vector3): Vector3 {
 }
 
 /**
+ * Compute reciprocal lattice vectors for a crystal system
+ */
+function getReciprocalLattice(system: string): { aStar: Vector3; bStar: Vector3; cStar: Vector3 } {
+  const params = SYSTEM_PARAMS[system] || SYSTEM_PARAMS.cubic;
+  const { a, b, c, alpha, beta, gamma } = params;
+
+  // Convert angles to radians
+  const alphaRad = (alpha * Math.PI) / 180;
+  const betaRad = (beta * Math.PI) / 180;
+  const gammaRad = (gamma * Math.PI) / 180;
+
+  // Direct lattice vectors in Cartesian coordinates
+  const aVec = vec3(a, 0, 0);
+  const bVec = vec3(b * Math.cos(gammaRad), b * Math.sin(gammaRad), 0);
+
+  const cx = c * Math.cos(betaRad);
+  const cy = c * (Math.cos(alphaRad) - Math.cos(betaRad) * Math.cos(gammaRad)) / Math.sin(gammaRad);
+  const cz = Math.sqrt(c * c - cx * cx - cy * cy);
+  const cVec = vec3(cx, cy, cz);
+
+  // Volume = a · (b × c)
+  const bCrossC = cross(bVec, cVec);
+  const V = dot(aVec, bCrossC);
+
+  // Reciprocal lattice vectors: a* = (b × c) / V, etc.
+  const aStar = scale(cross(bVec, cVec), 1 / V);
+  const bStar = scale(cross(cVec, aVec), 1 / V);
+  const cStar = scale(cross(aVec, bVec), 1 / V);
+
+  return { aStar, bStar, cStar };
+}
+
+/**
  * Convert Miller index to normal vector based on crystal system
+ * Uses proper reciprocal lattice transformation for all systems
  */
 function millerToNormal(miller: MillerIndex, system: string): Vector3 {
-  const params = SYSTEM_PARAMS[system] || SYSTEM_PARAMS.cubic;
-
   // For hexagonal/trigonal with 4-index notation, convert to 3-index
   let h = miller.h;
   let k = miller.k;
@@ -99,328 +129,390 @@ function millerToNormal(miller: MillerIndex, system: string): Vector3 {
     l = miller.l;
   }
 
-  // Convert to Cartesian normal based on crystal system
-  if (system === 'hexagonal' || system === 'trigonal') {
-    // Hexagonal axes transformation
-    const a1 = vec3(1, 0, 0);
-    const a2 = vec3(-0.5, Math.sqrt(3) / 2, 0);
-    const a3 = vec3(0, 0, params.c);
+  const params = SYSTEM_PARAMS[system] || SYSTEM_PARAMS.cubic;
 
-    const normal = add(add(scale(a1, h), scale(a2, k)), scale(a3, l));
-    return normalize(normal);
+  // Check for cubic system (simple case)
+  if (
+    params.a === params.b &&
+    params.b === params.c &&
+    params.alpha === 90 &&
+    params.beta === 90 &&
+    params.gamma === 90
+  ) {
+    return normalize(vec3(h, k, l));
   }
 
-  // For other systems, simple reciprocal lattice normal
-  const normal = vec3(h / params.a, k / params.b, l / params.c);
+  // For non-cubic systems, use reciprocal lattice vectors
+  const { aStar, bStar, cStar } = getReciprocalLattice(system);
+
+  // Normal = h * a* + k * b* + l * c*
+  const normal = vec3(
+    h * aStar.x + k * bStar.x + l * cStar.x,
+    h * aStar.y + k * bStar.y + l * cStar.y,
+    h * aStar.z + k * bStar.z + l * cStar.z
+  );
+
   return normalize(normal);
 }
 
 /**
  * Generate symmetry-equivalent normals based on point group
+ * Properly handles hexagonal/trigonal Miller index transformations
  */
-function generateSymmetryEquivalents(normal: Vector3, pointGroup: string): Vector3[] {
-  const normals: Vector3[] = [normal];
+function generateSymmetryEquivalents(normal: Vector3, miller: MillerIndex, pointGroup: string, system: string): { normal: Vector3; miller: MillerIndex }[] {
+  const results: { normal: Vector3; miller: MillerIndex }[] = [];
 
-  // Apply symmetry operations based on point group
-  // This is a simplified implementation for common point groups
+  // Get Miller indices
+  let h = miller.h;
+  let k = miller.k;
+  let l = miller.l;
 
-  if (pointGroup.includes('m3m') || pointGroup.includes('m-3m')) {
+  if (system === 'hexagonal' || system === 'trigonal') {
+    // Use proper Miller index transformations for hexagonal/trigonal
+    const millerEquivs = generateHexTrigonalEquivalents(h, k, l, pointGroup);
+    for (const [eh, ek, el] of millerEquivs) {
+      const equiv: MillerIndex = { h: eh, k: ek, l: el };
+      const n = millerToNormal(equiv, system);
+      results.push({ normal: n, miller: equiv });
+    }
+  } else if (pointGroup.includes('m3m') || pointGroup.includes('m-3m')) {
     // Full cubic symmetry (48 operations)
     const permutations = [
-      [1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1],
+      [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
     ];
     const signs = [
       [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
       [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1],
     ];
 
-    normals.length = 0;
+    const coords = [h, k, l];
+    const seen = new Set<string>();
+
     for (const perm of permutations) {
       for (const sign of signs) {
-        const coords = [normal.x, normal.y, normal.z];
-        const n = vec3(
-          coords[perm[0] - 1] * sign[0],
-          coords[perm[1] - 1] * sign[1],
-          coords[perm[2] - 1] * sign[2]
-        );
-        // Check if this normal is unique
-        const isUnique = !normals.some(
-          existing => Math.abs(existing.x - n.x) < 0.001 &&
-                      Math.abs(existing.y - n.y) < 0.001 &&
-                      Math.abs(existing.z - n.z) < 0.001
-        );
-        if (isUnique) normals.push(n);
-      }
-    }
-  } else if (pointGroup === '6/mmm') {
-    // Hexagonal symmetry (24 operations)
-    normals.length = 0;
-    for (let i = 0; i < 6; i++) {
-      const angle = (i * Math.PI) / 3;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
+        const eh = coords[perm[0]] * sign[0];
+        const ek = coords[perm[1]] * sign[1];
+        const el = coords[perm[2]] * sign[2];
 
-      // Rotate around z-axis
-      const rotated = vec3(
-        normal.x * cos - normal.y * sin,
-        normal.x * sin + normal.y * cos,
-        normal.z
-      );
-      normals.push(rotated);
-
-      // Mirror in z
-      normals.push(vec3(rotated.x, rotated.y, -rotated.z));
-
-      // Mirror in xy plane
-      normals.push(vec3(rotated.x, -rotated.y, rotated.z));
-      normals.push(vec3(rotated.x, -rotated.y, -rotated.z));
-    }
-  } else if (pointGroup === '4/mmm') {
-    // Tetragonal symmetry
-    normals.length = 0;
-    for (let i = 0; i < 4; i++) {
-      const angle = (i * Math.PI) / 2;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
-
-      const rotated = vec3(
-        normal.x * cos - normal.y * sin,
-        normal.x * sin + normal.y * cos,
-        normal.z
-      );
-      normals.push(rotated);
-      normals.push(vec3(rotated.x, rotated.y, -rotated.z));
-      normals.push(vec3(-rotated.x, rotated.y, rotated.z));
-      normals.push(vec3(-rotated.x, rotated.y, -rotated.z));
-    }
-  } else if (pointGroup === 'mmm') {
-    // Orthorhombic symmetry
-    normals.length = 0;
-    for (const sx of [1, -1]) {
-      for (const sy of [1, -1]) {
-        for (const sz of [1, -1]) {
-          normals.push(vec3(normal.x * sx, normal.y * sy, normal.z * sz));
+        const key = `${eh},${ek},${el}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const equiv: MillerIndex = { h: eh, k: ek, l: el };
+          const n = millerToNormal(equiv, system);
+          results.push({ normal: n, miller: equiv });
         }
       }
     }
-  } else if (pointGroup === '-3m') {
-    // Trigonal symmetry
-    normals.length = 0;
-    for (let i = 0; i < 3; i++) {
-      const angle = (i * 2 * Math.PI) / 3;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
-
-      const rotated = vec3(
-        normal.x * cos - normal.y * sin,
-        normal.x * sin + normal.y * cos,
-        normal.z
-      );
-      normals.push(rotated);
-      normals.push(vec3(rotated.x, rotated.y, -rotated.z));
-      normals.push(vec3(-rotated.y, -rotated.x, rotated.z));
-      normals.push(vec3(-rotated.y, -rotated.x, -rotated.z));
+  } else if (pointGroup === '4/mmm') {
+    // Tetragonal symmetry
+    const ops = [
+      [h, k, l], [k, -h, l], [-h, -k, l], [-k, h, l],
+      [h, -k, -l], [-h, k, -l], [k, h, -l], [-k, -h, -l],
+      [h, k, -l], [k, -h, -l], [-h, -k, -l], [-k, h, -l],
+      [h, -k, l], [-h, k, l], [k, h, l], [-k, -h, l],
+    ];
+    const seen = new Set<string>();
+    for (const [eh, ek, el] of ops) {
+      const key = `${eh},${ek},${el}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const equiv: MillerIndex = { h: eh, k: ek, l: el };
+        const n = millerToNormal(equiv, system);
+        results.push({ normal: n, miller: equiv });
+      }
     }
+  } else if (pointGroup === 'mmm') {
+    // Orthorhombic symmetry
+    const seen = new Set<string>();
+    for (const sx of [1, -1]) {
+      for (const sy of [1, -1]) {
+        for (const sz of [1, -1]) {
+          const eh = h * sx;
+          const ek = k * sy;
+          const el = l * sz;
+          const key = `${eh},${ek},${el}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            const equiv: MillerIndex = { h: eh, k: ek, l: el };
+            const n = millerToNormal(equiv, system);
+            results.push({ normal: n, miller: equiv });
+          }
+        }
+      }
+    }
+  } else {
+    // Default: just the original
+    results.push({ normal, miller });
   }
 
-  return normals;
+  return results;
 }
 
+// Miller index transformation matrices for hexagonal/trigonal systems
+// These are 3x3 matrices that transform (h, k, l) in Miller index space
+
+// C6z (60°): (h, k, l) -> (h+k, -h, l)
+const HEX_C6z: number[][] = [
+  [1, 1, 0],
+  [-1, 0, 0],
+  [0, 0, 1],
+];
+
+// C3z (120°): (h, k, l) -> (k, -h-k, l)
+const HEX_C3z: number[][] = [
+  [0, 1, 0],
+  [-1, -1, 0],
+  [0, 0, 1],
+];
+
+// C2 about [100] direction: (h, k, l) -> (h-k, -k, -l)
+const HEX_C2_100: number[][] = [
+  [1, 1, 0],
+  [0, -1, 0],
+  [0, 0, -1],
+];
+
+// C2 about [110] direction: (h, k, l) -> (k, h, -l)
+const HEX_C2_110: number[][] = [
+  [0, 1, 0],
+  [1, 0, 0],
+  [0, 0, -1],
+];
+
+// Mirror perpendicular to c
+const HEX_Mz: number[][] = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, -1],
+];
+
+// Mirror perpendicular to [100]
+const HEX_M_100: number[][] = [
+  [-1, -1, 0],
+  [0, 1, 0],
+  [0, 0, 1],
+];
+
+// Inversion
+const HEX_I: number[][] = [
+  [-1, 0, 0],
+  [0, -1, 0],
+  [0, 0, -1],
+];
+
+// Identity
+const HEX_E: number[][] = [
+  [1, 0, 0],
+  [0, 1, 0],
+  [0, 0, 1],
+];
+
 /**
- * Clip a convex polygon against a half-space defined by plane
+ * Multiply two 3x3 matrices
  */
-function clipPolygon(vertices: Vector3[], planeNormal: Vector3, planeDist: number): Vector3[] {
-  if (vertices.length === 0) return [];
-
-  const result: Vector3[] = [];
-
-  for (let i = 0; i < vertices.length; i++) {
-    const current = vertices[i];
-    const next = vertices[(i + 1) % vertices.length];
-
-    const currentDist = dot(current, planeNormal) - planeDist;
-    const nextDist = dot(next, planeNormal) - planeDist;
-
-    if (currentDist <= 0) {
-      // Current vertex is inside
-      result.push(current);
-    }
-
-    if ((currentDist > 0 && nextDist < 0) || (currentDist < 0 && nextDist > 0)) {
-      // Edge crosses plane, compute intersection
-      const t = currentDist / (currentDist - nextDist);
-      const intersection = add(current, scale(sub(next, current), t));
-      result.push(intersection);
+function matMul(A: number[][], B: number[][]): number[][] {
+  const result: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      for (let k = 0; k < 3; k++) {
+        result[i][j] += A[i][k] * B[k][j];
+      }
     }
   }
-
   return result;
 }
 
 /**
- * Create initial large cube vertices
+ * Apply matrix to Miller index
  */
-function createInitialCube(size: number): Vector3[] {
+function applyMatrixToMiller(M: number[][], h: number, k: number, l: number): [number, number, number] {
   return [
-    vec3(-size, -size, -size),
-    vec3(size, -size, -size),
-    vec3(size, size, -size),
-    vec3(-size, size, -size),
-    vec3(-size, -size, size),
-    vec3(size, -size, size),
-    vec3(size, size, size),
-    vec3(-size, size, size),
+    Math.round(M[0][0] * h + M[0][1] * k + M[0][2] * l),
+    Math.round(M[1][0] * h + M[1][1] * k + M[1][2] * l),
+    Math.round(M[2][0] * h + M[2][1] * k + M[2][2] * l),
   ];
 }
 
 /**
- * Create face from vertices with proper winding
+ * Check if two matrices are equal
  */
-function createFace(vertices: Vector3[], faceNormal: Vector3): Face {
-  // Ensure vertices are wound correctly (counter-clockwise when viewed from outside)
-  const center = vertices.reduce(
-    (acc, v) => add(acc, scale(v, 1 / vertices.length)),
-    vec3(0, 0, 0)
-  );
+function matEqual(A: number[][], B: number[][]): boolean {
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      if (Math.abs(A[i][j] - B[i][j]) > 1e-10) return false;
+    }
+  }
+  return true;
+}
 
-  // Calculate face normal from vertices
-  if (vertices.length >= 3) {
-    const edge1 = sub(vertices[1], vertices[0]);
-    const edge2 = sub(vertices[2], vertices[0]);
-    const calculatedNormal = normalize(cross(edge1, edge2));
+/**
+ * Generate point group from generators using closure
+ */
+function generateGroup(generators: number[][][], maxElements = 200): number[][][] {
+  const group: number[][][] = [HEX_E];
+  const queue: number[][][] = [...generators];
 
-    // If calculated normal points opposite to expected, reverse vertices
-    if (dot(calculatedNormal, faceNormal) < 0) {
-      vertices.reverse();
+  while (queue.length > 0 && group.length < maxElements) {
+    const newOp = queue.shift()!;
+
+    // Check if already in group
+    let isNew = true;
+    for (const existing of group) {
+      if (matEqual(newOp, existing)) {
+        isNew = false;
+        break;
+      }
+    }
+
+    if (isNew) {
+      group.push(newOp);
+      // Generate new elements by multiplication
+      for (const gen of generators) {
+        queue.push(matMul(newOp, gen));
+        queue.push(matMul(gen, newOp));
+      }
+    }
+  }
+
+  return group;
+}
+
+// Cache for hex/trigonal point group operations
+const hexPointGroupCache: Record<string, number[][][]> = {};
+
+/**
+ * Get Miller index transformation matrices for hexagonal/trigonal point groups
+ */
+function getHexPointGroupOperations(pointGroup: string): number[][][] {
+  if (hexPointGroupCache[pointGroup]) {
+    return hexPointGroupCache[pointGroup];
+  }
+
+  // Generators for each point group
+  const generatorsMap: Record<string, number[][][]> = {
+    // Hexagonal
+    '6/mmm': [HEX_C6z, HEX_C2_100, HEX_Mz],
+    '622': [HEX_C6z, HEX_C2_100],
+    '6mm': [HEX_C6z, HEX_M_100],
+    '-6m2': [HEX_C3z, HEX_Mz, HEX_M_100],
+    '6/m': [HEX_C6z, HEX_Mz],
+    '-6': [HEX_C3z, HEX_Mz],
+    '6': [HEX_C6z],
+    // Trigonal
+    '-3m': [HEX_C3z, HEX_C2_110, HEX_I],
+    '32': [HEX_C3z, HEX_C2_110],
+    '3m': [HEX_C3z, HEX_M_100],
+    '-3': [HEX_C3z, HEX_I],
+    '3': [HEX_C3z],
+  };
+
+  const generators = generatorsMap[pointGroup] || [];
+  const operations = generators.length > 0 ? generateGroup(generators) : [HEX_E];
+
+  hexPointGroupCache[pointGroup] = operations;
+  return operations;
+}
+
+/**
+ * Generate symmetry-equivalent Miller indices for hexagonal/trigonal systems
+ * Uses proper matrix-based group generation
+ */
+function generateHexTrigonalEquivalents(h: number, k: number, l: number, pointGroup: string): [number, number, number][] {
+  const operations = getHexPointGroupOperations(pointGroup);
+  const seen = new Set<string>();
+  const results: [number, number, number][] = [];
+
+  for (const op of operations) {
+    const [eh, ek, el] = applyMatrixToMiller(op, h, k, l);
+    const key = `${eh},${ek},${el}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      results.push([eh, ek, el]);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Build halfspace data from parsed CDL
+ */
+function buildHalfspaces(parsed: CDLParseResult): { halfspaces: HalfspaceData; millerIndices: MillerIndex[] } {
+  const normals: Vector3[] = [];
+  const distances: number[] = [];
+  const millerIndices: MillerIndex[] = [];
+
+  for (const form of parsed.forms) {
+    const baseNormal = millerToNormal(form.millerIndex, parsed.system);
+    const equivalents = generateSymmetryEquivalents(baseNormal, form.millerIndex, parsed.pointGroup, parsed.system);
+
+    for (const equiv of equivalents) {
+      // Check for duplicates
+      const isDuplicate = normals.some(
+        (n, i) => Math.abs(dot(n, equiv.normal) - 1) < 0.001 &&
+                  Math.abs(distances[i] - form.scale) < 0.001
+      );
+
+      if (!isDuplicate) {
+        normals.push(equiv.normal);
+        distances.push(form.scale);
+        millerIndices.push(equiv.miller);
+      }
     }
   }
 
   return {
-    vertices: [...vertices],
-    normal: faceNormal,
+    halfspaces: { normals, distances },
+    millerIndices,
   };
 }
 
 /**
- * Generate crystal geometry from parsed CDL
+ * Build edge list from faces
  */
-export function generateGeometry(parsed: CDLParseResult): CrystalGeometry {
-  const allPlanes: { normal: Vector3; distance: number; millerIndex: MillerIndex }[] = [];
-
-  // Generate planes for each crystal form
-  for (const form of parsed.forms) {
-    const baseNormal = millerToNormal(form.millerIndex, parsed.system);
-    const symmetryNormals = generateSymmetryEquivalents(baseNormal, parsed.pointGroup);
-
-    for (const normal of symmetryNormals) {
-      // Distance from origin (adjusted by scale)
-      const distance = form.scale;
-
-      // Avoid duplicate planes
-      const isDuplicate = allPlanes.some(
-        p => Math.abs(dot(p.normal, normal) - 1) < 0.001 &&
-             Math.abs(p.distance - distance) < 0.001
-      );
-
-      if (!isDuplicate) {
-        allPlanes.push({ normal, distance, millerIndex: form.millerIndex });
-      }
-    }
-  }
-
-  // Start with a large initial polyhedron and clip against all planes
-  const faces: Face[] = [];
-  const vertexMap = new Map<string, number>();
-  const vertices: Vector3[] = [];
-
-  // For each plane, we'll compute its contribution to the final shape
-  for (const plane of allPlanes) {
-    // Create initial face as large quad perpendicular to normal
-    const size = 10;
-
-    // Find two vectors perpendicular to the normal
-    let tangent: Vector3;
-    if (Math.abs(plane.normal.y) < 0.9) {
-      tangent = normalize(cross(plane.normal, vec3(0, 1, 0)));
-    } else {
-      tangent = normalize(cross(plane.normal, vec3(1, 0, 0)));
-    }
-    const bitangent = cross(plane.normal, tangent);
-
-    // Create initial square face on the plane
-    const center = scale(plane.normal, plane.distance);
-    let faceVertices: Vector3[] = [
-      add(add(center, scale(tangent, -size)), scale(bitangent, -size)),
-      add(add(center, scale(tangent, size)), scale(bitangent, -size)),
-      add(add(center, scale(tangent, size)), scale(bitangent, size)),
-      add(add(center, scale(tangent, -size)), scale(bitangent, size)),
-    ];
-
-    // Clip against all other planes
-    for (const clipPlane of allPlanes) {
-      if (clipPlane === plane) continue;
-      faceVertices = clipPolygon(faceVertices, clipPlane.normal, clipPlane.distance);
-      if (faceVertices.length < 3) break;
-    }
-
-    if (faceVertices.length >= 3) {
-      const face = createFace(faceVertices, plane.normal);
-      face.millerIndex = plane.millerIndex;
-      faces.push(face);
-
-      // Add unique vertices
-      for (const v of face.vertices) {
-        const key = `${v.x.toFixed(4)},${v.y.toFixed(4)},${v.z.toFixed(4)}`;
-        if (!vertexMap.has(key)) {
-          vertexMap.set(key, vertices.length);
-          vertices.push(v);
-        }
-      }
-    }
-  }
-
-  // Build edge list
+function buildEdges(faces: Face[], vertices: Vector3[]): [number, number][] {
   const edgeSet = new Set<string>();
   const edges: [number, number][] = [];
+  const vertexMap = new Map<string, number>();
+
+  // Build vertex index map
+  vertices.forEach((v, i) => {
+    const key = `${v.x.toFixed(6)},${v.y.toFixed(6)},${v.z.toFixed(6)}`;
+    vertexMap.set(key, i);
+  });
 
   for (const face of faces) {
     for (let i = 0; i < face.vertices.length; i++) {
       const v1 = face.vertices[i];
       const v2 = face.vertices[(i + 1) % face.vertices.length];
 
-      const key1 = `${v1.x.toFixed(4)},${v1.y.toFixed(4)},${v1.z.toFixed(4)}`;
-      const key2 = `${v2.x.toFixed(4)},${v2.y.toFixed(4)},${v2.z.toFixed(4)}`;
+      const key1 = `${v1.x.toFixed(6)},${v1.y.toFixed(6)},${v1.z.toFixed(6)}`;
+      const key2 = `${v2.x.toFixed(6)},${v2.y.toFixed(6)},${v2.z.toFixed(6)}`;
 
-      const idx1 = vertexMap.get(key1)!;
-      const idx2 = vertexMap.get(key2)!;
+      const idx1 = vertexMap.get(key1);
+      const idx2 = vertexMap.get(key2);
 
-      const edgeKey = idx1 < idx2 ? `${idx1}-${idx2}` : `${idx2}-${idx1}`;
-      if (!edgeSet.has(edgeKey)) {
-        edgeSet.add(edgeKey);
-        edges.push([idx1, idx2]);
+      if (idx1 !== undefined && idx2 !== undefined) {
+        const edgeKey = idx1 < idx2 ? `${idx1}-${idx2}` : `${idx2}-${idx1}`;
+        if (!edgeSet.has(edgeKey)) {
+          edgeSet.add(edgeKey);
+          edges.push([idx1, idx2]);
+        }
       }
     }
   }
 
-  let geometry: CrystalGeometry = { vertices, faces, edges };
-
-  // Apply modifications (elongate, flatten, scale)
-  if (parsed.modifications && parsed.modifications.length > 0) {
-    geometry = applyModifications(geometry, parsed.modifications);
-  }
-
-  // Apply twin transformation
-  if (parsed.twin) {
-    geometry = generateTwinnedGeometry(geometry, parsed.twin.law);
-  }
-
-  return geometry;
+  return edges;
 }
 
 /**
- * Apply modifications to geometry (elongate, flatten, scale)
+ * Apply modifications to halfspace data (elongate, flatten, scale)
+ * Modifies distances based on axis scales
  */
-function applyModifications(geom: CrystalGeometry, mods: ModificationSpec[]): CrystalGeometry {
+function applyModificationsToHalfspaces(
+  halfspaces: HalfspaceData,
+  mods: ModificationSpec[]
+): HalfspaceData {
   // Calculate scale factors for each axis
   const scales = { a: 1, b: 1, c: 1 };
 
@@ -432,14 +524,64 @@ function applyModifications(geom: CrystalGeometry, mods: ModificationSpec[]): Cr
     scales[mod.axis] *= factor;
   }
 
-  // Apply scales to vertices
+  // Transform normals and distances to account for anisotropic scaling
+  // When we scale space by S, the halfspace n·x = d becomes:
+  // (S^-1 n)·(S x) = d, so effective normal is S^-1 n (unnormalized)
+  // and effective distance scales with normal length
+  const newNormals: Vector3[] = [];
+  const newDistances: number[] = [];
+
+  for (let i = 0; i < halfspaces.normals.length; i++) {
+    const n = halfspaces.normals[i];
+    const d = halfspaces.distances[i];
+
+    // Apply inverse scale to normal
+    const scaledN: Vector3 = {
+      x: n.x / scales.a,
+      y: n.y / scales.b,
+      z: n.z / scales.c,
+    };
+
+    // Normalize and adjust distance
+    const len = length(scaledN);
+    if (len > 1e-10) {
+      newNormals.push({
+        x: scaledN.x / len,
+        y: scaledN.y / len,
+        z: scaledN.z / len,
+      });
+      // When scaling space by S, plane n·x=d becomes (S⁻¹n)·x'=d
+      // Normalizing: n'·x' = d/|S⁻¹n|
+      newDistances.push(d / len);
+    } else {
+      newNormals.push(n);
+      newDistances.push(d);
+    }
+  }
+
+  return { normals: newNormals, distances: newDistances };
+}
+
+/**
+ * Apply modifications to geometry (post-computation)
+ */
+function applyModificationsToGeometry(geom: CrystalGeometry, mods: ModificationSpec[]): CrystalGeometry {
+  const scales = { a: 1, b: 1, c: 1 };
+
+  for (const mod of mods) {
+    let factor = mod.factor;
+    if (mod.type === 'flatten') {
+      factor = 1 / factor;
+    }
+    scales[mod.axis] *= factor;
+  }
+
   const newVertices = geom.vertices.map(v => ({
     x: v.x * scales.a,
     y: v.y * scales.b,
     z: v.z * scales.c,
   }));
 
-  // Apply scales to face vertices and recalculate normals
   const newFaces = geom.faces.map(face => {
     const scaledVertices = face.vertices.map(v => ({
       x: v.x * scales.a,
@@ -447,7 +589,6 @@ function applyModifications(geom: CrystalGeometry, mods: ModificationSpec[]): Cr
       z: v.z * scales.c,
     }));
 
-    // Recalculate normal after scaling
     let normal = face.normal;
     if (scaledVertices.length >= 3) {
       const v0 = scaledVertices[0];
@@ -470,4 +611,38 @@ function applyModifications(geom: CrystalGeometry, mods: ModificationSpec[]): Cr
     faces: newFaces,
     edges: geom.edges,
   };
+}
+
+/**
+ * Generate crystal geometry from parsed CDL
+ *
+ * Follows Python approach: compute geometry first, then apply modifications
+ * to vertices. This ensures elongate/flatten work correctly with all forms.
+ */
+export function generateGeometry(parsed: CDLParseResult): CrystalGeometry {
+  // Build halfspace data from forms
+  const { halfspaces, millerIndices } = buildHalfspaces(parsed);
+
+  let geometry: CrystalGeometry;
+
+  // Generate geometry (twinned or base) from unmodified halfspaces
+  if (parsed.twin) {
+    geometry = generateTwinnedGeometry(halfspaces, parsed.twin.law);
+  } else {
+    // Compute base geometry from halfspaces
+    const result = computeHalfspaceIntersection(halfspaces);
+    const edges = buildEdges(result.faces, result.vertices);
+    geometry = {
+      vertices: result.vertices,
+      faces: result.faces,
+      edges,
+    };
+  }
+
+  // Apply modifications to vertices AFTER computing geometry (like Python)
+  if (parsed.modifications && parsed.modifications.length > 0) {
+    geometry = applyModificationsToGeometry(geometry, parsed.modifications);
+  }
+
+  return geometry;
 }
