@@ -4,7 +4,7 @@
  */
 
 import type { Context } from 'hono';
-import { parseCDL } from '../lib/cdl-parser';
+import { parseCDL, flatForms } from '../lib/cdl-parser';
 
 interface ValidateRequest {
   cdl: string;
@@ -45,8 +45,9 @@ export async function validateHandler(c: Context): Promise<Response> {
       });
     }
 
-    // Format Miller indices for response
-    const forms = result.parsed.forms.map((form) => {
+    // Flatten form tree and format Miller indices for response
+    const flat = flatForms(result.parsed.forms);
+    const forms = flat.map((form) => {
       const m = form.millerIndex;
       const millerStr =
         m.i !== undefined

@@ -6,6 +6,7 @@
  */
 
 import type { CDLParseResult, MillerIndex, ModificationSpec } from './cdl-parser';
+import { flatForms } from './cdl-parser';
 import type { HalfspaceData } from './halfspace';
 import { computeHalfspaceIntersection } from './halfspace';
 import { generateTwinnedGeometry } from './twin-generator';
@@ -442,7 +443,8 @@ function buildHalfspaces(parsed: CDLParseResult): { halfspaces: HalfspaceData; m
   const distances: number[] = [];
   const millerIndices: MillerIndex[] = [];
 
-  for (const form of parsed.forms) {
+  const flat = flatForms(parsed.forms);
+  for (const form of flat) {
     const baseNormal = millerToNormal(form.millerIndex, parsed.system);
     const equivalents = generateSymmetryEquivalents(baseNormal, form.millerIndex, parsed.pointGroup, parsed.system);
 
